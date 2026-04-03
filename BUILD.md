@@ -9,6 +9,12 @@
 | Rust (rustc + cargo) | 1.77+ | 后端编译 |
 | Node.js | 18+ | 前端构建 |
 | pnpm | 10+ | 前端包管理 |
+| tauri-cli | 2.0+ | Tauri 打包（仅打包时需要） |
+
+安装 tauri-cli：
+```bash
+cargo install tauri-cli
+```
 
 ### 平台特定依赖
 
@@ -237,3 +243,22 @@ cargo clean && cargo build --release
 # 检查 Tauri 特性编译
 cargo check --features tauri/custom-protocol
 ```
+
+### DMG 打包失败
+
+macOS 上 `pnpm tauri:build` 可能在 DMG 生成阶段失败（签名/工具链问题），但 `.app` 已成功生成：
+```bash
+# 直接使用 .app
+open target/release/bundle/macos/恒境.app
+
+# 或手动安装二进制
+cp target/release/等 target/release/恒境 ~/.local/bin/
+```
+
+### cargo build --release 后弹窗白屏
+
+直接 `cargo build --release` 编译的二进制使用 `custom-protocol` 加载内嵌前端资源。
+如果前端未通过 `pnpm build` 构建到 `dist/`，弹窗会白屏。
+
+解决方法：使用 `pnpm tauri:build`（自动执行 `pnpm build` + `cargo build --release`），
+或开发时使用 `pnpm tauri:dev`。
