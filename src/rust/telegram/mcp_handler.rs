@@ -4,7 +4,7 @@ use teloxide::prelude::*;
 
 use crate::config::load_standalone_config;
 use crate::mcp::types::{build_continue_response, build_send_response, PopupRequest};
-use crate::telegram::{handle_callback_query, handle_text_message, TelegramCore, TelegramEvent};
+use crate::telegram::{handle_callback_query, handle_text_message, CallbackAction, ActionEvent, TelegramCore, TelegramEvent};
 use crate::log_important;
 
 /// 处理纯Telegram模式的MCP请求（不启动GUI）
@@ -43,15 +43,9 @@ pub async fn handle_telegram_only_mcp_request(request_file: &str) -> Result<()> 
     // 发送消息到Telegram
     let predefined_options = request.predefined_options.clone().unwrap_or_default();
 
-    // 发送选项消息
-    core.send_options_message(&request.message, &predefined_options, request.is_markdown)
+    // 发送选项消息（含操作按钮）
+    core.send_options_message(&request.message, &predefined_options, request.is_markdown, request.client_name.as_deref(), true)
         .await?;
-
-    // 短暂延迟确保消息顺序
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-    // 发送操作消息（假设启用继续回复）
-    core.send_operation_message(true).await?;
 
     // 启动消息监听循环
     start_telegram_mcp_listener(core, request, predefined_options).await
@@ -90,7 +84,12 @@ async fn start_telegram_mcp_listener(
                                 &predefined_options,
                                 &mut selected_options,
                                 &mut options_message_id,
+                                &user_input,
+                                &request,
                             ).await {
+                                if let Some(_result) = e.downcast_ref::<ProcessingComplete>() {
+                                    return Ok(());
+                                }
                                 log_important!(warn, "处理callback query失败: {}", e);
                             }
                         }
@@ -132,12 +131,9 @@ async fn handle_callback_query_update(
     predefined_options: &[String],
     selected_options: &mut HashSet<String>,
     options_message_id: &mut Option<i32>,
+    user_input: &str,
+    request: &PopupRequest,
 ) -> Result<()> {
-    // 只有当有预定义选项时才处理 callback queries
-    if predefined_options.is_empty() {
-        return Ok(());
-    }
-
     // 从callback_query中提取消息ID
     if let Some(message) = &callback_query.message {
         if options_message_id.is_none() {
@@ -145,20 +141,32 @@ async fn handle_callback_query_update(
         }
     }
 
-    if let Ok(Some(option)) = handle_callback_query(&core.bot, callback_query, core.chat_id).await {
-        // 切换选项状态
-        if selected_options.contains(&option) {
-            selected_options.remove(&option);
-        } else {
-            selected_options.insert(option.clone());
-        }
+    if let Ok(Some(action)) = handle_callback_query(&core.bot, callback_query, core.chat_id, predefined_options).await {
+        match action {
+            CallbackAction::ActionEvent(ActionEvent::Send) => {
+                handle_send_pressed(core, selected_options, user_input, request).await?;
+                return Err(ProcessingComplete.into());
+            }
+            CallbackAction::ActionEvent(ActionEvent::Continue) => {
+                handle_continue_pressed(core, request).await?;
+                return Err(ProcessingComplete.into());
+            }
+            CallbackAction::OptionToggled(option) => {
+                // 切换选项状态
+                if selected_options.contains(&option) {
+                    selected_options.remove(&option);
+                } else {
+                    selected_options.insert(option.clone());
+                }
 
-        // 更新按钮状态
-        if let Some(msg_id) = *options_message_id {
-            let selected_vec: Vec<String> = selected_options.iter().cloned().collect();
-            let _ = core
-                .update_inline_keyboard(msg_id, predefined_options, &selected_vec)
-                .await;
+                // 更新按钮状态
+                if let Some(msg_id) = *options_message_id {
+                    let selected_vec: Vec<String> = selected_options.iter().cloned().collect();
+                    let _ = core
+                        .update_inline_keyboard(msg_id, predefined_options, &selected_vec, true)
+                        .await;
+                }
+            }
         }
     }
 
@@ -169,14 +177,14 @@ async fn handle_callback_query_update(
 async fn handle_message_update(
     core: &TelegramCore,
     message: &teloxide::types::Message,
-    predefined_options: &[String],
+    _predefined_options: &[String],
     options_message_id: &mut Option<i32>,
     user_input: &mut String,
     selected_options: &HashSet<String>,
     request: &PopupRequest,
 ) -> Result<()> {
     // 识别选项消息ID
-    identify_options_message_id(message, predefined_options, options_message_id);
+    identify_options_message_id(message, options_message_id);
 
     // 处理文本消息事件
     if let Ok(Some(event)) = handle_text_message(message, core.chat_id, None).await {
@@ -202,33 +210,26 @@ async fn handle_message_update(
 /// 识别选项消息ID
 fn identify_options_message_id(
     message: &teloxide::types::Message,
-    predefined_options: &[String],
     options_message_id: &mut Option<i32>,
 ) {
-    // 只有当有预定义选项时才检查 inline keyboard
-    if predefined_options.is_empty() {
-        return;
-    }
-
-    // 检查是否是包含 inline keyboard 的选项消息
+    // 检查是否是包含 inline keyboard 的消息
     if let Some(inline_keyboard) = message.reply_markup() {
-        // 检查是否包含我们的选项按钮
-        let mut contains_our_options = false;
+        let mut contains_our_buttons = false;
         for row in &inline_keyboard.inline_keyboard {
             for button in row {
                 if let teloxide::types::InlineKeyboardButtonKind::CallbackData(callback_data) = &button.kind {
-                    if callback_data.starts_with("toggle:") {
-                        contains_our_options = true;
+                    if callback_data.starts_with("t:") || callback_data.starts_with("action:") || callback_data.starts_with("toggle:") {
+                        contains_our_buttons = true;
                         break;
                     }
                 }
             }
-            if contains_our_options {
+            if contains_our_buttons {
                 break;
             }
         }
 
-        if contains_our_options {
+        if contains_our_buttons {
             *options_message_id = Some(message.id.0);
         }
     }

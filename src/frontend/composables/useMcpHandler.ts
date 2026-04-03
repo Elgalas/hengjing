@@ -82,6 +82,7 @@ export function useMcpHandler() {
           message: request.message,
           predefinedOptions: request.predefined_options || [],
           isMarkdown: request.is_markdown || false,
+          clientName: request.client_name || null,
         })
         console.log('✅ Telegram同步启动成功')
       }

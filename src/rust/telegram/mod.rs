@@ -6,8 +6,8 @@ pub mod mcp_handler;
 
 pub use commands::*;
 pub use core::{
-    handle_callback_query, handle_text_message, test_telegram_connection, TelegramCore,
-    TelegramEvent,
+    handle_callback_query, handle_text_message, test_telegram_connection, CallbackAction,
+    ActionEvent, TelegramCore, TelegramEvent,
 };
 pub use integration::TelegramIntegration;
 pub use markdown::process_telegram_markdown;
