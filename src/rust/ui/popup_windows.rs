@@ -161,6 +161,8 @@ pub async fn open_popup_window(app: &AppHandle, request: PopupRequest) -> Result
     .visible(true)
     .resizable(true)
     .decorations(true)
+    .title_bar_style(tauri::TitleBarStyle::Overlay)
+    .hidden_title(true)
     .always_on_top(always_on_top)
     .build()
     {

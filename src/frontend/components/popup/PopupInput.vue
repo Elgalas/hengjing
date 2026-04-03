@@ -605,8 +605,8 @@ function handleTextInput(event: Event) {
     userInput.value = textarea.value
   }
 
-  // 触发防抖的 emit（避免频繁通知父组件）
-  debouncedEmitUpdate()
+  // 立即通知父组件（确保 canSubmit 实时更新）
+  emitUpdateImmediate()
 }
 
 // 滚动到光标位置 - 简化版
