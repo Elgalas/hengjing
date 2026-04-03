@@ -1,4 +1,5 @@
 import { computed, ref } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
 import { useAudioManager } from './useAudioManager'
 import { useFontManager } from './useFontManager'
 import { usePopupSession } from './usePopupSession'
@@ -66,7 +67,24 @@ export function usePopupAppManager() {
       }
 
       // 加载当前窗口绑定的请求
-      await popupSession.loadCurrentRequest()
+      const request = await popupSession.loadCurrentRequest()
+
+      // 启动 Telegram 同步
+      try {
+        if (request?.message) {
+          await invoke('start_telegram_sync', {
+            message: request.message,
+            predefinedOptions: request.predefined_options || [],
+            isMarkdown: request.is_markdown || false,
+            clientName: request.client_name || null,
+            requestId: request.id || null,
+          })
+        }
+      }
+      catch (error) {
+        console.error('启动Telegram同步失败:', error)
+      }
+
       isInitializing.value = false
     }
     catch (error) {

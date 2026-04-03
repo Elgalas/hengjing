@@ -1,7 +1,8 @@
 use crate::config::{save_config, AppState, TelegramConfig};
 use crate::constants::telegram as telegram_constants;
 use crate::telegram::{
-    handle_callback_query, handle_text_message, CallbackAction, ActionEvent, TelegramCore,
+    DispatcherConfig, SessionAction, SessionEvent,
+    get_or_init_dispatcher,
 };
 use crate::log_important;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -76,7 +77,7 @@ pub async fn auto_get_chat_id(
 ) -> Result<(), String> {
     // 获取API URL配置
     let mut bot = Bot::new(bot_token.clone());
-    
+
     if let Some(state) = app_handle.try_state::<AppState>() {
         if let Ok(config) = state.config.lock() {
             let api_url = &config.telegram_config.api_base_url;
@@ -148,6 +149,24 @@ pub async fn auto_get_chat_id(
     Ok(())
 }
 
+/// 发送带 request_id 的 Telegram 事件到前端
+/// 将 TelegramEvent 序列化后注入 request_id 字段，实现多弹窗事件路由
+fn emit_telegram_event_with_id(
+    app_handle: &AppHandle,
+    event: &crate::telegram::TelegramEvent,
+    request_id: &str,
+) {
+    if let Ok(mut value) = serde_json::to_value(event) {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "request_id".to_string(),
+                serde_json::Value::String(request_id.to_string()),
+            );
+        }
+        let _ = app_handle.emit("telegram-event", &value);
+    }
+}
+
 /// 发送Telegram消息（供其他模块调用）
 pub async fn send_telegram_message(
     bot_token: &str,
@@ -164,6 +183,7 @@ pub async fn send_telegram_message_with_markdown(
     message: &str,
     use_markdown: bool,
 ) -> Result<(), String> {
+    use crate::telegram::TelegramCore;
     let core =
         TelegramCore::new(bot_token.to_string(), chat_id.to_string()).map_err(|e| e.to_string())?;
 
@@ -172,26 +192,33 @@ pub async fn send_telegram_message_with_markdown(
         .map_err(|e| e.to_string())
 }
 
-/// 启动Telegram同步（完整版本）
+/// 启动Telegram同步（使用中心化调度器）
 #[tauri::command]
 pub async fn start_telegram_sync(
     message: String,
     predefined_options: Vec<String>,
     is_markdown: bool,
     client_name: Option<String>,
+    request_id: Option<String>,
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> Result<(), String> {
     // 获取Telegram配置
-    let (enabled, bot_token, chat_id, continue_reply_enabled) = {
+    let (enabled, bot_token, chat_id, api_url, continue_reply_enabled) = {
         let config = state
             .config
             .lock()
             .map_err(|e| format!("获取配置失败: {}", e))?;
+        let api_url = if config.telegram_config.api_base_url == telegram_constants::API_BASE_URL {
+            None
+        } else {
+            Some(config.telegram_config.api_base_url.clone())
+        };
         (
             config.telegram_config.enabled,
             config.telegram_config.bot_token.clone(),
             config.telegram_config.chat_id.clone(),
+            api_url,
             config.reply_config.enable_continue_reply,
         )
     };
@@ -204,262 +231,88 @@ pub async fn start_telegram_sync(
         return Err("Telegram配置不完整".to_string());
     }
 
-    // 获取API URL配置
-    let api_url = {
-        let config = state
-            .config
-            .lock()
-            .map_err(|e| format!("获取配置失败: {}", e))?;
-        config.telegram_config.api_base_url.clone()
-    };
+    // 获取或初始化全局调度器
+    let dispatcher = get_or_init_dispatcher(DispatcherConfig {
+        bot_token,
+        chat_id,
+        api_url,
+    })
+    .await
+    .map_err(|e| format!("初始化Telegram调度器失败: {}", e))?;
 
-    // 使用默认API URL时传递None，否则传递自定义URL
-    let api_url_option = if api_url == telegram_constants::API_BASE_URL {
-        None
-    } else {
-        Some(api_url)
-    };
+    // 生成请求 ID（如果前端未传递）
+    let req_id = request_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    // 创建Telegram核心实例
-    let core = TelegramCore::new_with_api_url(bot_token.clone(), chat_id.clone(), api_url_option)
-        .map_err(|e| format!("创建Telegram核心失败: {}", e))?;
+    // 注册会话
+    let (mut event_rx, req_short, seq_num) = dispatcher
+        .register_session(req_id, predefined_options.clone(), continue_reply_enabled)
+        .await;
 
-    // 发送选项消息（含操作按钮）
-    core.send_options_message(&message, &predefined_options, is_markdown, client_name.as_deref(), continue_reply_enabled)
-        .await
-        .map_err(|e| format!("发送选项消息失败: {}", e))?;
-
-    // 启动消息监听（根据是否有预定义选项选择监听模式）
-    let bot_token_clone = bot_token.clone();
-    let chat_id_clone = chat_id.clone();
-    let app_handle_clone = app_handle.clone();
-
-    tokio::spawn(async move {
-        // 使用统一的监听器，传递选项参数
-        match start_telegram_listener(
-            bot_token_clone,
-            chat_id_clone,
-            app_handle_clone,
-            predefined_options,
+    // 发送选项消息到 Telegram
+    let send_result = dispatcher
+        .send_options_message(
+            &req_short,
+            seq_num,
+            &message,
+            &predefined_options,
+            is_markdown,
+            client_name.as_deref(),
             continue_reply_enabled,
         )
-        .await
-        {
-            Ok(_) => {}
-            Err(e) => log_important!(warn, "Telegram消息监听出错: {}", e),
+        .await;
+
+    if let Err(e) = send_result {
+        // 发送失败，回滚会话注册
+        dispatcher.unregister_session(&req_short).await;
+        return Err(format!("发送选项消息失败: {}", e));
+    }
+
+    // 启动事件消费 task，将 dispatcher 事件转发到前端
+    let req_short_clone = req_short.clone();
+    tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                SessionEvent::Action(SessionAction::Send) => {
+                    // 获取会话状态
+                    if let Some(disp) = crate::telegram::get_dispatcher_async().await {
+                        let state = disp.get_session_state(&req_short_clone).await;
+                        let (selected_list, user_input) = state.unwrap_or_default();
+
+                        // 发送反馈消息
+                        let feedback = crate::telegram::core::build_feedback_message(
+                            &selected_list, &user_input, false,
+                        );
+                        let _ = disp.send_message(&feedback).await;
+
+                        // emit 前端事件（带 request_id 路由）
+                        use crate::telegram::TelegramEvent;
+                        emit_telegram_event_with_id(&app_handle, &TelegramEvent::SendPressed, &req_short_clone);
+
+                        // 注销会话
+                        disp.unregister_session(&req_short_clone).await;
+                    }
+                    break;
+                }
+                SessionEvent::Action(SessionAction::Continue) => {
+                    if let Some(disp) = crate::telegram::get_dispatcher_async().await {
+                        let feedback = crate::telegram::core::build_feedback_message(
+                            &[], "", true,
+                        );
+                        let _ = disp.send_message(&feedback).await;
+
+                        use crate::telegram::TelegramEvent;
+                        emit_telegram_event_with_id(&app_handle, &TelegramEvent::ContinuePressed, &req_short_clone);
+
+                        disp.unregister_session(&req_short_clone).await;
+                    }
+                    break;
+                }
+                SessionEvent::Telegram(telegram_event) => {
+                    emit_telegram_event_with_id(&app_handle, &telegram_event, &req_short_clone);
+                }
+            }
         }
     });
 
     Ok(())
-}
-
-/// 启动Telegram消息监听（统一版本，支持有选项和无选项模式）
-async fn start_telegram_listener(
-    bot_token: String,
-    chat_id: String,
-    app_handle: AppHandle,
-    predefined_options_list: Vec<String>,
-    continue_reply_enabled: bool,
-) -> Result<(), String> {
-    // 从AppHandle获取应用状态来读取API URL配置
-    let api_url = match app_handle.try_state::<AppState>() {
-        Some(state) => {
-            let config = state
-                .config
-                .lock()
-                .map_err(|e| format!("获取配置失败: {}", e))?;
-            let api_url = config.telegram_config.api_base_url.clone();
-                         if api_url == telegram_constants::API_BASE_URL {
-                None
-            } else {
-                Some(api_url)
-            }
-        }
-        None => None, // 如果无法获取状态，使用默认API
-    };
-
-    let core = TelegramCore::new_with_api_url(bot_token, chat_id, api_url)
-        .map_err(|e| format!("创建Telegram核心失败: {}", e))?;
-
-    let mut offset = 0i32;
-
-    // 用于跟踪选项状态和消息ID
-    let mut selected_options: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut options_message_id: Option<i32> = None;
-    let mut user_input: String = String::new(); // 存储用户输入的文本
-    let predefined_options = predefined_options_list;
-
-    // 获取当前最新的消息ID作为基准
-    if let Ok(updates) = core.bot.get_updates().limit(10).await {
-        if let Some(update) = updates.last() {
-            offset = update.id.0 as i32 + 1;
-        }
-    }
-
-    // 监听循环
-    loop {
-        match core.bot.get_updates().offset(offset).timeout(10).await {
-            Ok(updates) => {
-                for update in updates {
-                    offset = update.id.0 as i32 + 1;
-
-                    match update.kind {
-                        teloxide::types::UpdateKind::CallbackQuery(callback_query) => {
-                            // 从callback_query中提取消息ID
-                            if let Some(message) = &callback_query.message {
-                                if options_message_id.is_none() {
-                                    options_message_id = Some(message.id().0);
-                                }
-                            }
-
-                            if let Ok(Some(action)) =
-                                handle_callback_query(&core.bot, &callback_query, core.chat_id, &predefined_options)
-                                    .await
-                            {
-                                match action {
-                                    CallbackAction::ActionEvent(ActionEvent::Send) => {
-                                        // 发送操作
-                                        let selected_list: Vec<String> =
-                                            selected_options.iter().cloned().collect();
-                                        let feedback_message =
-                                            crate::telegram::core::build_feedback_message(
-                                                &selected_list,
-                                                &user_input,
-                                                false,
-                                            );
-                                        let _ = core.send_message(&feedback_message).await;
-
-                                        use crate::telegram::TelegramEvent;
-                                        let event = TelegramEvent::SendPressed;
-                                        let _ = app_handle.emit("telegram-event", &event);
-                                    }
-                                    CallbackAction::ActionEvent(ActionEvent::Continue) => {
-                                        // 继续操作
-                                        let feedback_message =
-                                            crate::telegram::core::build_feedback_message(
-                                                &[], "", true,
-                                            );
-                                        let _ = core.send_message(&feedback_message).await;
-
-                                        use crate::telegram::TelegramEvent;
-                                        let event = TelegramEvent::ContinuePressed;
-                                        let _ = app_handle.emit("telegram-event", &event);
-                                    }
-                                    CallbackAction::OptionToggled(option) => {
-                                        // 切换选项状态
-                                        let selected = if selected_options.contains(&option) {
-                                            selected_options.remove(&option);
-                                            false
-                                        } else {
-                                            selected_options.insert(option.clone());
-                                            true
-                                        };
-
-                                        // 发送事件到前端
-                                        use crate::telegram::TelegramEvent;
-                                        let event = TelegramEvent::OptionToggled {
-                                            option: option.clone(),
-                                            selected,
-                                        };
-                                        let _ = app_handle.emit("telegram-event", &event);
-
-                                        // 更新按钮状态
-                                        if let Some(msg_id) = options_message_id {
-                                            let selected_vec: Vec<String> =
-                                                selected_options.iter().cloned().collect();
-                                            let _ = core
-                                                .update_inline_keyboard(
-                                                    msg_id,
-                                                    &predefined_options,
-                                                    &selected_vec,
-                                                    continue_reply_enabled,
-                                                )
-                                                .await;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        teloxide::types::UpdateKind::Message(message) => {
-                            // 检查是否是包含 inline keyboard 的选项消息
-                            if let Some(inline_keyboard) = message.reply_markup() {
-                                let mut contains_our_buttons = false;
-                                for row in &inline_keyboard.inline_keyboard {
-                                    for button in row {
-                                        if let teloxide::types::InlineKeyboardButtonKind::CallbackData(callback_data) = &button.kind {
-                                            if callback_data.starts_with("t:") || callback_data.starts_with("action:") || callback_data.starts_with("toggle:") {
-                                                contains_our_buttons = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if contains_our_buttons {
-                                        break;
-                                    }
-                                }
-                                if contains_our_buttons {
-                                    options_message_id = Some(message.id.0);
-                                }
-                            }
-
-                            if let Ok(Some(event)) = handle_text_message(
-                                &message,
-                                core.chat_id,
-                                None, // 简化版本不过滤消息ID
-                            )
-                            .await
-                            {
-                                // 处理发送和继续按钮，发送反馈消息
-                                match &event {
-                                    crate::telegram::TelegramEvent::SendPressed => {
-                                        let selected_list: Vec<String> =
-                                            selected_options.iter().cloned().collect();
-
-                                        // 使用统一的反馈消息生成函数
-                                        let feedback_message =
-                                            crate::telegram::core::build_feedback_message(
-                                                &selected_list,
-                                                &user_input,
-                                                false, // 不是继续操作
-                                            );
-
-                                        let _ = core.send_message(&feedback_message).await;
-                                    }
-                                    crate::telegram::TelegramEvent::ContinuePressed => {
-                                        // 使用统一的反馈消息生成函数
-                                        let feedback_message =
-                                            crate::telegram::core::build_feedback_message(
-                                                &[],  // 继续操作没有选项
-                                                "",   // 继续操作没有用户输入
-                                                true, // 是继续操作
-                                            );
-
-                                        let _ = core.send_message(&feedback_message).await;
-                                    }
-                                    crate::telegram::TelegramEvent::TextUpdated { text } => {
-                                        // 保存用户输入的文本
-                                        user_input = text.clone();
-                                    }
-                                    _ => {
-                                        // 其他事件不需要发送反馈消息
-                                    }
-                                }
-
-                                let _ = app_handle.emit("telegram-event", &event);
-                            }
-                        }
-                        _ => {
-                            // 忽略其他类型的更新
-                        }
-                    }
-                }
-            }
-            Err(_) => {
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            }
-        }
-
-        // 短暂延迟避免过于频繁的请求
-        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-    }
 }

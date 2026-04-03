@@ -143,6 +143,14 @@ async function setupTelegramListener() {
 function handleTelegramEvent(event: any) {
   console.log('🎯 [McpPopup] 开始处理事件:', event.type)
 
+  // 多弹窗事件路由：如果事件有 request_id，过滤不属于当前弹窗的事件
+  if (event.request_id && props.request?.id) {
+    if (!props.request.id.startsWith(event.request_id)) {
+      console.log('🎯 [McpPopup] 忽略非本弹窗事件, event_id:', event.request_id, 'my_id:', props.request.id.slice(0, 8))
+      return
+    }
+  }
+
   switch (event.type) {
     case 'option_toggled':
       console.log('🎯 [McpPopup] 处理选项切换:', event.option)

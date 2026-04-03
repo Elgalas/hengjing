@@ -1,10 +1,11 @@
 use anyhow::Result;
-use std::collections::HashSet;
-use teloxide::prelude::*;
 
 use crate::config::load_standalone_config;
 use crate::mcp::types::{build_continue_response, build_send_response, PopupRequest};
-use crate::telegram::{handle_callback_query, handle_text_message, CallbackAction, ActionEvent, TelegramCore, TelegramEvent};
+use crate::telegram::{
+    DispatcherConfig, SessionAction, SessionEvent,
+    get_or_init_dispatcher,
+};
 use crate::log_important;
 
 /// 处理纯Telegram模式的MCP请求（不启动GUI）
@@ -27,285 +28,113 @@ pub async fn handle_telegram_only_mcp_request(request_file: &str) -> Result<()> 
         return Ok(());
     }
 
-    // 创建Telegram核心实例，使用配置中的API URL
+    // 准备 API URL
     let api_url = if telegram_config.api_base_url == crate::constants::telegram::API_BASE_URL {
         None
     } else {
         Some(telegram_config.api_base_url.clone())
     };
 
-    let core = TelegramCore::new_with_api_url(
-        telegram_config.bot_token.clone(),
-        telegram_config.chat_id.clone(),
+    // 获取或初始化全局调度器
+    let dispatcher = get_or_init_dispatcher(DispatcherConfig {
+        bot_token: telegram_config.bot_token.clone(),
+        chat_id: telegram_config.chat_id.clone(),
         api_url,
-    )?;
+    }).await?;
 
-    // 发送消息到Telegram
     let predefined_options = request.predefined_options.clone().unwrap_or_default();
+    let continue_reply_enabled = app_config.reply_config.enable_continue_reply;
 
-    // 发送选项消息（含操作按钮）
-    core.send_options_message(&request.message, &predefined_options, request.is_markdown, request.client_name.as_deref(), true)
-        .await?;
+    // 注册会话
+    let (mut event_rx, req_short, seq_num) = dispatcher
+        .register_session(
+            request.id.clone(),
+            predefined_options.clone(),
+            continue_reply_enabled,
+        )
+        .await;
 
-    // 启动消息监听循环
-    start_telegram_mcp_listener(core, request, predefined_options).await
-}
+    // 发送选项消息到 Telegram
+    let send_result = dispatcher
+        .send_options_message(
+            &req_short,
+            seq_num,
+            &request.message,
+            &predefined_options,
+            request.is_markdown,
+            request.client_name.as_deref(),
+            continue_reply_enabled,
+        )
+        .await;
 
-/// 启动Telegram MCP消息监听循环
-async fn start_telegram_mcp_listener(
-    core: TelegramCore,
-    request: PopupRequest,
-    predefined_options: Vec<String>,
-) -> Result<()> {
-    let mut offset = 0i32;
-    let mut selected_options: HashSet<String> = HashSet::new();
-    let mut user_input = String::new();
-    let mut options_message_id: Option<i32> = None;
-
-    // 获取当前最新的消息ID作为基准
-    if let Ok(updates) = core.bot.get_updates().limit(10).await {
-        if let Some(update) = updates.last() {
-            offset = update.id.0 as i32 + 1;
-        }
+    if let Err(e) = send_result {
+        // 发送失败，回滚会话注册
+        dispatcher.unregister_session(&req_short).await;
+        return Err(e);
     }
 
-    // 监听循环（简化版本，只等待发送或继续操作）
-    loop {
-        match core.bot.get_updates().offset(offset).timeout(10).await {
-            Ok(updates) => {
-                for update in updates {
-                    offset = update.id.0 as i32 + 1;
-
-                    match update.kind {
-                        teloxide::types::UpdateKind::CallbackQuery(callback_query) => {
-                            if let Err(e) = handle_callback_query_update(
-                                &core,
-                                &callback_query,
-                                &predefined_options,
-                                &mut selected_options,
-                                &mut options_message_id,
-                                &user_input,
-                                &request,
-                            ).await {
-                                if let Some(_result) = e.downcast_ref::<ProcessingComplete>() {
-                                    return Ok(());
-                                }
-                                log_important!(warn, "处理callback query失败: {}", e);
-                            }
-                        }
-                        teloxide::types::UpdateKind::Message(message) => {
-                            // 处理选项消息ID识别
-                            if let Err(e) = handle_message_update(
-                                &core,
-                                &message,
-                                &predefined_options,
-                                &mut options_message_id,
-                                &mut user_input,
-                                &selected_options,
-                                &request,
-                            ).await {
-                                if let Some(_result) = e.downcast_ref::<ProcessingComplete>() {
-                                    return Ok(());
-                                }
-                                log_important!(warn, "处理消息失败: {}", e);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Err(_) => {
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            }
-        }
-
-        // 短暂延迟避免过于频繁的请求
-        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-    }
-}
-
-/// 处理callback query更新
-async fn handle_callback_query_update(
-    core: &TelegramCore,
-    callback_query: &teloxide::types::CallbackQuery,
-    predefined_options: &[String],
-    selected_options: &mut HashSet<String>,
-    options_message_id: &mut Option<i32>,
-    user_input: &str,
-    request: &PopupRequest,
-) -> Result<()> {
-    // 从callback_query中提取消息ID
-    if let Some(message) = &callback_query.message {
-        if options_message_id.is_none() {
-            *options_message_id = Some(message.id().0);
-        }
-    }
-
-    if let Ok(Some(action)) = handle_callback_query(&core.bot, callback_query, core.chat_id, predefined_options).await {
-        match action {
-            CallbackAction::ActionEvent(ActionEvent::Send) => {
-                handle_send_pressed(core, selected_options, user_input, request).await?;
-                return Err(ProcessingComplete.into());
-            }
-            CallbackAction::ActionEvent(ActionEvent::Continue) => {
-                handle_continue_pressed(core, request).await?;
-                return Err(ProcessingComplete.into());
-            }
-            CallbackAction::OptionToggled(option) => {
-                // 切换选项状态
-                if selected_options.contains(&option) {
-                    selected_options.remove(&option);
-                } else {
-                    selected_options.insert(option.clone());
-                }
-
-                // 更新按钮状态
-                if let Some(msg_id) = *options_message_id {
-                    let selected_vec: Vec<String> = selected_options.iter().cloned().collect();
-                    let _ = core
-                        .update_inline_keyboard(msg_id, predefined_options, &selected_vec, true)
-                        .await;
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// 处理消息更新
-async fn handle_message_update(
-    core: &TelegramCore,
-    message: &teloxide::types::Message,
-    _predefined_options: &[String],
-    options_message_id: &mut Option<i32>,
-    user_input: &mut String,
-    selected_options: &HashSet<String>,
-    request: &PopupRequest,
-) -> Result<()> {
-    // 识别选项消息ID
-    identify_options_message_id(message, options_message_id);
-
-    // 处理文本消息事件
-    if let Ok(Some(event)) = handle_text_message(message, core.chat_id, None).await {
+    // 等待事件（CLI 模式是阻塞式的）
+    while let Some(event) = event_rx.recv().await {
         match event {
-            TelegramEvent::SendPressed => {
-                handle_send_pressed(core, selected_options, user_input, request).await?;
-                return Err(ProcessingComplete.into());
+            SessionEvent::Action(SessionAction::Send) => {
+                // 获取选中选项和用户输入
+                let (selected_list, user_input) = dispatcher
+                    .get_session_state(&req_short)
+                    .await
+                    .unwrap_or_default();
+
+                let user_input_option = if user_input.is_empty() {
+                    None
+                } else {
+                    Some(user_input.clone())
+                };
+
+                let response = build_send_response(
+                    user_input_option,
+                    selected_list.clone(),
+                    vec![], // 无GUI模式下没有图片
+                    Some(request.id.clone()),
+                    "telegram",
+                );
+
+                // 输出JSON响应到stdout（MCP协议要求）
+                println!("{}", response);
+
+                // 发送确认消息
+                let feedback = crate::telegram::core::build_feedback_message(
+                    &selected_list, &user_input, false,
+                );
+                let _ = dispatcher.send_message(&feedback).await;
+
+                // 注销会话
+                dispatcher.unregister_session(&req_short).await;
+                return Ok(());
             }
-            TelegramEvent::ContinuePressed => {
-                handle_continue_pressed(core, request).await?;
-                return Err(ProcessingComplete.into());
+            SessionEvent::Action(SessionAction::Continue) => {
+                let response = build_continue_response(
+                    Some(request.id.clone()),
+                    "telegram_continue",
+                );
+
+                // 输出JSON响应到stdout
+                println!("{}", response);
+
+                // 发送确认消息
+                let feedback = crate::telegram::core::build_feedback_message(
+                    &[], "", true,
+                );
+                let _ = dispatcher.send_message(&feedback).await;
+
+                // 注销会话
+                dispatcher.unregister_session(&req_short).await;
+                return Ok(());
             }
-            TelegramEvent::TextUpdated { text } => {
-                *user_input = text;
+            SessionEvent::Telegram(_) => {
+                // CLI 模式下 Telegram 事件（选项切换、文本更新）
+                // 已由 dispatcher 内部管理状态，无需额外处理
             }
-            _ => {}
         }
     }
 
     Ok(())
 }
-
-/// 识别选项消息ID
-fn identify_options_message_id(
-    message: &teloxide::types::Message,
-    options_message_id: &mut Option<i32>,
-) {
-    // 检查是否是包含 inline keyboard 的消息
-    if let Some(inline_keyboard) = message.reply_markup() {
-        let mut contains_our_buttons = false;
-        for row in &inline_keyboard.inline_keyboard {
-            for button in row {
-                if let teloxide::types::InlineKeyboardButtonKind::CallbackData(callback_data) = &button.kind {
-                    if callback_data.starts_with("t:") || callback_data.starts_with("action:") || callback_data.starts_with("toggle:") {
-                        contains_our_buttons = true;
-                        break;
-                    }
-                }
-            }
-            if contains_our_buttons {
-                break;
-            }
-        }
-
-        if contains_our_buttons {
-            *options_message_id = Some(message.id.0);
-        }
-    }
-}
-
-/// 处理发送按钮按下
-async fn handle_send_pressed(
-    core: &TelegramCore,
-    selected_options: &HashSet<String>,
-    user_input: &str,
-    request: &PopupRequest,
-) -> Result<()> {
-    // 使用统一的响应构建函数
-    let selected_list: Vec<String> = selected_options.iter().cloned().collect();
-
-    let user_input_option = if user_input.is_empty() {
-        None
-    } else {
-        Some(user_input.to_string())
-    };
-
-    let response = build_send_response(
-        user_input_option,
-        selected_list.clone(),
-        vec![], // 无GUI模式下没有图片
-        Some(request.id.clone()),
-        "telegram",
-    );
-
-    // 输出JSON响应到stdout（MCP协议要求）
-    println!("{}", response);
-
-    // 发送确认消息（使用统一的反馈消息生成函数）
-    let feedback_message = crate::telegram::core::build_feedback_message(
-        &selected_list,
-        user_input,
-        false, // 不是继续操作
-    );
-    let _ = core.send_message(&feedback_message).await;
-
-    Ok(())
-}
-
-/// 处理继续按钮按下
-async fn handle_continue_pressed(
-    core: &TelegramCore,
-    request: &PopupRequest,
-) -> Result<()> {
-    // 使用统一的继续响应构建函数
-    let response = build_continue_response(
-        Some(request.id.clone()),
-        "telegram_continue",
-    );
-
-    // 输出JSON响应到stdout（MCP协议要求）
-    println!("{}", response);
-
-    // 发送确认消息（使用统一的反馈消息生成函数）
-    let feedback_message = crate::telegram::core::build_feedback_message(
-        &[],  // 继续操作没有选项
-        "",   // 继续操作没有用户输入
-        true, // 是继续操作
-    );
-    let _ = core.send_message(&feedback_message).await;
-
-    Ok(())
-}
-
-/// 处理完成标记（用于从监听循环中退出）
-#[derive(Debug)]
-struct ProcessingComplete;
-
-impl std::fmt::Display for ProcessingComplete {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Processing complete")
-    }
-}
-
-impl std::error::Error for ProcessingComplete {}
