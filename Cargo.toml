@@ -31,7 +31,9 @@ tokio = { version = "1.0", features = [
   "fs", # 文件操作需要
   "process", # Command::new() 需要
   "sync", # oneshot channel 需要
-  "time" # sleep() 需要
+  "time", # sleep() 需要
+  "net", # UnixListener/UnixStream 需要（IPC通信）
+  "io-util" # AsyncBufReadExt/BufReader 需要（IPC通信）
 ] }
 anyhow = "1.0"
 thiserror = "1.0"

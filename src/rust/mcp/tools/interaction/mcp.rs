@@ -1,4 +1,3 @@
-use anyhow::Result;
 use rmcp::{Error as McpError, model::*};
 
 use crate::mcp::{HengRequest, PopupRequest};
@@ -26,7 +25,7 @@ impl InteractionTool {
             is_markdown: request.is_markdown,
         };
 
-        match create_tauri_popup(&popup_request) {
+        match create_tauri_popup(&popup_request).await {
             Ok(response) => {
                 // 解析响应内容，支持文本和图片
                 let content = parse_mcp_response(&response)?;

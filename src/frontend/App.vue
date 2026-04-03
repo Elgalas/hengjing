@@ -1,10 +1,19 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
+import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import AppContent from './components/AppContent.vue'
 import { useAppManager } from './composables/useAppManager'
+import { usePopupAppManager } from './composables/usePopupAppManager'
 import { useEventHandlers } from './composables/useEventHandlers'
 
-// 使用封装的应用管理器
+// 检测当前窗口角色：popup-xxx 窗口使用独立的 PopupAppManager
+const isPopupWindow = ref(false)
+const windowLabel = getCurrentWebviewWindow().label
+isPopupWindow.value = windowLabel.startsWith('popup-')
+
+// 根据窗口角色选择不同的应用管理器
+const manager = isPopupWindow.value ? usePopupAppManager() : useAppManager()
+
 const {
   naiveTheme,
   mcpRequest,
@@ -12,7 +21,7 @@ const {
   appConfig,
   isInitializing,
   actions,
-} = useAppManager()
+} = manager
 
 // 创建事件处理器
 const handlers = useEventHandlers(actions)

@@ -1,5 +1,7 @@
 use crate::config::AppState;
+use crate::ipc::IpcStateWrapper;
 use crate::ui::AudioController;
+use crate::ui::popup_windows::PopupSessionState;
 use crate::app::{setup::setup_application, commands::*};
 use crate::log_important;
 use std::sync::atomic::AtomicBool;
@@ -16,6 +18,8 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
         .manage(AudioController {
             should_stop: Arc::new(AtomicBool::new(false)),
         })
+        .manage(PopupSessionState::default())
+        .manage(IpcStateWrapper::default())
         .invoke_handler(tauri::generate_handler![
             // 基础应用命令
             get_app_info,
@@ -71,6 +75,12 @@ pub fn build_tauri_app() -> Builder<tauri::Wry> {
             build_mcp_send_response,
             build_mcp_continue_response,
             create_test_popup,
+
+            // IPC + Popup 窗口命令
+            crate::ipc::commands::send_ipc_response,
+            crate::ui::popup_windows::get_popup_request_for_current_window,
+            crate::ui::popup_windows::send_popup_response,
+            crate::ui::popup_windows::cancel_popup_request,
             
             // acemcp命令（迁移至 tools::acemcp::commands）
             crate::mcp::tools::acemcp::commands::get_acemcp_config,

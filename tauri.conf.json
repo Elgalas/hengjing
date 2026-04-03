@@ -59,6 +59,25 @@
             "updater:allow-install",
             "core:window:allow-start-dragging"
           ]
+        },
+        {
+          "identifier": "popup-capability",
+          "description": "Popup window capabilities",
+          "windows": [
+            "popup-*"
+          ],
+          "permissions": [
+            "core:event:allow-listen",
+            "core:event:allow-unlisten",
+            "core:event:allow-emit",
+            "core:window:allow-show",
+            "core:window:allow-hide",
+            "core:window:allow-close",
+            "core:window:allow-destroy",
+            "core:window:allow-set-focus",
+            "core:window:allow-set-always-on-top",
+            "core:window:allow-start-dragging"
+          ]
         }
       ]
     }

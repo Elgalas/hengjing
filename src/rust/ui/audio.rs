@@ -247,6 +247,30 @@ fn play_audio_sync_with_controller(audio_path: &PathBuf, app: &AppHandle) -> Res
 
 
 
+/// 内部播放通知音效（供 popup_windows 等非 Tauri command 上下文使用）
+///
+/// 与 play_notification_sound 的区别：不需要 State<AppState>，直接通过 AppHandle 获取状态
+pub fn play_notification_sound_internal(app: &AppHandle) -> Result<()> {
+    let state = app.state::<AppState>();
+    let (enabled, audio_url) = {
+        let config = state.config.lock().map_err(|e| anyhow::anyhow!("获取配置失败: {}", e))?;
+        (config.audio_config.notification_enabled, config.audio_config.custom_url.clone())
+    };
+
+    if !enabled {
+        return Ok(());
+    }
+
+    let app_handle = app.clone();
+    tokio::spawn(async move {
+        if let Err(e) = play_audio_file(&app_handle, &audio_url).await {
+            log_important!(warn, "播放音频失败: {}", e);
+        }
+    });
+
+    Ok(())
+}
+
 /// 确保默认音频文件存在，如果不存在则从资源目录复制
 pub async fn ensure_audio_file_exists(app: &AppHandle) -> Result<()> {
     let manager = get_audio_asset_manager();

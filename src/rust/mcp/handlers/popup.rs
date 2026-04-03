@@ -3,12 +3,39 @@ use std::process::Command;
 use std::fs;
 use std::path::Path;
 
+use crate::ipc::IpcClient;
+use crate::ipc::IpcRequest;
 use crate::mcp::types::PopupRequest;
+use crate::log_important;
 
-/// 创建 Tauri 弹窗
+/// 创建 Tauri 弹窗（异步版本）
 ///
-/// 优先调用与 MCP 服务器同目录的 UI 命令，找不到时使用全局版本
-pub fn create_tauri_popup(request: &PopupRequest) -> Result<String> {
+/// 优先通过 IPC 发送请求到已运行的 UI 进程。
+/// 如果 UI 未运行，回退到启动子进程的方式。
+pub async fn create_tauri_popup(request: &PopupRequest) -> Result<String> {
+    // 优先尝试 IPC 通信（UI 已运行时）
+    if IpcClient::is_ui_running().await {
+        log_important!(info, "检测到 UI 进程已运行，通过 IPC 发送请求: {}", request.id);
+        let ipc_request = IpcRequest::from(request);
+        match IpcClient::send_request(&ipc_request).await {
+            Ok(response) => {
+                log_important!(info, "IPC 请求 {} 收到响应", request.id);
+                return Ok(response);
+            }
+            Err(e) => {
+                log_important!(warn, "IPC 请求失败，回退到子进程模式: {}", e);
+                // 回退到子进程模式
+            }
+        }
+    }
+
+    // 回退：启动子进程
+    log_important!(info, "通过子进程模式创建弹窗: {}", request.id);
+    create_tauri_popup_subprocess(request)
+}
+
+/// 通过子进程创建弹窗（原有逻辑）
+fn create_tauri_popup_subprocess(request: &PopupRequest) -> Result<String> {
     // 创建临时请求文件 - 跨平台适配
     let temp_dir = std::env::temp_dir();
     let temp_file = temp_dir.join(format!("mcp_request_{}.json", request.id));
