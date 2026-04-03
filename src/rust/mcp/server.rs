@@ -6,6 +6,8 @@ use rmcp::{
     service::RequestContext,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use super::tools::{InteractionTool, MemoryTool, AcemcpTool};
 use super::types::{HengRequest, JiyiRequest};
@@ -15,6 +17,8 @@ use crate::{log_important, log_debug};
 #[derive(Clone)]
 pub struct HengServer {
     enabled_tools: HashMap<String, bool>,
+    /// MCP 客户端名称（在 initialize 时从 client_info 获取）
+    client_name: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for HengServer {
@@ -34,7 +38,7 @@ impl HengServer {
             }
         };
 
-        Self { enabled_tools }
+        Self { enabled_tools, client_name: Arc::new(Mutex::new(None)) }
     }
 
     /// 检查工具是否启用 - 动态读取最新配置
@@ -70,9 +74,13 @@ impl ServerHandler for HengServer {
 
     async fn initialize(
         &self,
-        _request: InitializeRequestParam,
+        request: InitializeRequestParam,
         _context: RequestContext<RoleServer>,
     ) -> Result<ServerInfo, McpError> {
+        // 保存客户端名称
+        let client_name = request.client_info.name.clone();
+        log_debug!("MCP 客户端连接: {} v{}", client_name, request.client_info.version);
+        *self.client_name.lock().await = Some(client_name);
         Ok(self.get_info())
     }
 
@@ -181,8 +189,11 @@ impl ServerHandler for HengServer {
                 let heng_request: HengRequest = serde_json::from_value(arguments_value)
                     .map_err(|e| McpError::invalid_params(format!("参数解析失败: {}", e), None))?;
 
+                // 获取客户端名称
+                let client_name = self.client_name.lock().await.clone();
+
                 // 调用恒境工具
-                InteractionTool::heng(heng_request).await
+                InteractionTool::heng(heng_request, client_name).await
             }
             "ji" => {
                 // 检查记忆管理工具是否启用

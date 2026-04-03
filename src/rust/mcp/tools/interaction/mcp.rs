@@ -13,6 +13,7 @@ pub struct InteractionTool;
 impl InteractionTool {
     pub async fn heng(
         request: HengRequest,
+        client_name: Option<String>,
     ) -> Result<CallToolResult, McpError> {
         let popup_request = PopupRequest {
             id: generate_request_id(),
@@ -23,6 +24,7 @@ impl InteractionTool {
                 Some(request.predefined_options)
             },
             is_markdown: request.is_markdown,
+            client_name,
         };
 
         match create_tauri_popup(&popup_request).await {

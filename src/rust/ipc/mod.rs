@@ -20,6 +20,8 @@ pub struct IpcRequest {
     pub message: String,
     pub predefined_options: Option<Vec<String>>,
     pub is_markdown: bool,
+    /// MCP 客户端名称
+    pub client_name: Option<String>,
 }
 
 /// IPC 响应
@@ -38,6 +40,7 @@ impl From<&crate::mcp::types::PopupRequest> for IpcRequest {
             message: request.message.clone(),
             predefined_options: request.predefined_options.clone(),
             is_markdown: request.is_markdown,
+            client_name: request.client_name.clone(),
         }
     }
 }
@@ -49,6 +52,7 @@ impl From<IpcRequest> for crate::mcp::types::PopupRequest {
             message: request.message,
             predefined_options: request.predefined_options,
             is_markdown: request.is_markdown,
+            client_name: request.client_name,
         }
     }
 }

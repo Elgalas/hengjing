@@ -140,6 +140,7 @@ onUnmounted(() => {
           :loading="false"
           :show-main-layout="showPopupSettings"
           :always-on-top="props.appConfig.window.alwaysOnTop"
+          :client-name="props.mcpRequest?.client_name || ''"
           @theme-change="$emit('themeChange', $event)"
           @open-main-layout="togglePopupSettings"
           @toggle-always-on-top="$emit('toggleAlwaysOnTop')"

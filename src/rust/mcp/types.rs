@@ -51,6 +51,8 @@ pub struct PopupRequest {
     pub message: String,
     pub predefined_options: Option<Vec<String>>,
     pub is_markdown: bool,
+    /// MCP 客户端名称（如 "claude-code"、"cursor" 等）
+    pub client_name: Option<String>,
 }
 
 /// 新的结构化响应数据格式

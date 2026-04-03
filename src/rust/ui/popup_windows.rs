@@ -147,13 +147,19 @@ pub async fn open_popup_window(app: &AppHandle, request: PopupRequest) -> Result
         (window_config.free_width, window_config.free_height)
     };
 
+    // 动态窗口标题（包含客户端名称）
+    let window_title = match &request.client_name {
+        Some(name) => format!("恒境 - {}", name),
+        None => "恒境".to_string(),
+    };
+
     // 创建新的 popup 窗口
     let popup_window = match tauri::WebviewWindowBuilder::new(
         app,
         window_label.clone(),
         WebviewUrl::App("index.html".into()),
     )
-    .title("恒境")
+    .title(&window_title)
     .inner_size(width, height)
     .min_inner_size(window_config.min_width, window_config.min_height)
     .max_inner_size(window_config.max_width, window_config.max_height)
